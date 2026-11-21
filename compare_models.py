@@ -152,6 +152,104 @@ def check_window_lengths(X_t: np.ndarray, X_a: np.ndarray, args) -> None:
             )
         )
 
+def make_chronological_validation_windows(
+    train_data,
+    args,
+    val_ratio: float = 0.2,
+):
+    """
+    Create train/validation windows using a chronological raw-data split.
+
+    Scalers are fitted only on the first part of the training period.
+    The validation windows retain the previous encoder context.
+    """
+    df_a, df_t = train_data
+
+    input_steps = int(args.t_enc_time_steps)
+    split_idx = int(len(df_t) * (1.0 - val_ratio))
+
+    if split_idx <= input_steps:
+        raise ValueError("Not enough data for chronological validation.")
+
+    # 1. Split target data by time
+    prefix_t = df_t.iloc[:split_idx]
+    val_t = df_t.iloc[split_idx:]
+
+    # 2. Auxiliary data before validation starts
+    val_start = val_t.index[0]
+    prefix_a = df_a.loc[df_a.index < val_start]
+
+    # 3. Keep previous target observations as validation encoder context
+    context_t = pd.concat([
+        prefix_t.tail(input_steps),
+        val_t,
+    ])
+
+    # Auxiliary data beginning at the same timestamp as context_t
+    context_a = df_a.loc[context_t.index[0]:]
+
+    # 4. Check frequency ratio
+    ratio = 1.0 / float(args.t_a1_freq_ratio)
+    step = round(ratio)
+
+    if not np.isclose(ratio, step):
+        raise ValueError("Frequency ratio must be an integer.")
+
+    if len(prefix_a) != len(prefix_t) * step:
+        raise ValueError("Training prefix auxiliary/target lengths do not match.")
+
+    if len(context_a) != len(context_t) * step:
+        raise ValueError("Validation auxiliary/target lengths do not match.")
+
+    # 5. Fit scalers ONLY on the training prefix
+    scaler_a = MinMaxScaler()
+    scaler_t = MinMaxScaler()
+
+    prefix_a_scaled = scaler_a.fit_transform(prefix_a)
+    prefix_t_scaled = scaler_t.fit_transform(prefix_t)
+
+    # Validation data are transformed using the already-fitted scalers
+    context_a_scaled = scaler_a.transform(context_a)
+    context_t_scaled = scaler_t.transform(context_t)
+
+    target_idx = df_t.columns.get_loc(args.key_var)
+
+    # 6. Create training windows
+    X_t_train, X_a_train, y_t_train, y_a_train = build_windows(
+        prefix_a_scaled,
+        prefix_t_scaled,
+        args,
+        target_idx,
+    )
+
+    # 7. Create validation windows
+    X_t_val, X_a_val, y_t_val, y_a_val = build_windows(
+        context_a_scaled,
+        context_t_scaled,
+        args,
+        target_idx,
+    )
+
+    check_window_lengths(X_t_train, X_a_train, args)
+    check_window_lengths(X_t_val, X_a_val, args)
+
+    if len(X_t_val) != len(val_t):
+        raise ValueError(
+            "Validation windows do not align with validation observations."
+        )
+
+    return {
+        "X_t_train": X_t_train,
+        "X_a_train": X_a_train,
+        "y_t_train": y_t_train,
+        "y_a_train": y_a_train,
+        "X_t_val": X_t_val,
+        "X_a_val": X_a_val,
+        "y_t_val": y_t_val,
+        "y_a_val": y_a_val,
+        "scaler_a": scaler_a,
+        "scaler_t": scaler_t,
+    }
 
 def flatten_mixed_windows(X_t: np.ndarray, X_a: np.ndarray) -> np.ndarray:
     """Create unrestricted lag regressors: all target and auxiliary lags."""
@@ -159,7 +257,43 @@ def flatten_mixed_windows(X_t: np.ndarray, X_a: np.ndarray) -> np.ndarray:
         [X_t.reshape(len(X_t), -1), X_a.reshape(len(X_a), -1)], axis=1
     ).astype(np.float64)
 
+def check_mixed_frequency_alignment(
+    train_data,
+    test_data,
+    args
+):
+    # Số mẫu auxiliary tương ứng với một mẫu target
+    ratio = 1.0 / float(args.t_a1_freq_ratio)
+    step = round(ratio)
 
+    if not np.isclose(ratio, step):
+        raise ValueError(
+            "Frequency ratio does not correspond to an integer step."
+        )
+
+    for name, (data_a, data_t) in [
+        ("Train", train_data),
+        ("Test", test_data)
+    ]:
+        # Kiểm tra số lượng mẫu
+        if len(data_a) != len(data_t) * step:
+            raise ValueError(
+                f"{name}: Auxiliary/Target length mismatch. "
+                f"Expected {len(data_t) * step}, "
+                f"got {len(data_a)}."
+            )
+
+        # Lấy timestamp auxiliary cách nhau 6 giờ
+        aligned_aux_index = data_a.index[::step]
+
+        # So sánh với timestamp target
+        if not aligned_aux_index.equals(data_t.index):
+            raise ValueError(
+                f"{name}: Auxiliary and Target timestamps "
+                "are not aligned."
+            )
+
+    print("Train/Test frequency alignment: PASSED")
 # ---------------------------------------------------------------------------
 # 1. Naive baseline
 # ---------------------------------------------------------------------------
@@ -311,82 +445,149 @@ def gaussian_nll(mean: torch.Tensor, sigma: torch.Tensor, target: torch.Tensor) 
     return (torch.log(sigma) + 0.5 * standardized.pow(2)).mean()
 
 
-def fit_deepar(
+def select_deepar_epoch(
     model: DeepARGaussian,
     X_train: np.ndarray,
     y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     args,
     device: torch.device,
-) -> Tuple[DeepARGaussian, float, int]:
-    n = len(y_train)
-    if n < 10:
-        raise ValueError("DeepAR requires at least 10 training windows.")
-    val_n = max(1, int(round(n * 0.2)))
-    split = n - val_n
-    if split < 2:
-        raise ValueError("Not enough windows after the DeepAR validation split.")
+) -> Tuple[int, float]:
+    """Select the best training epoch using chronological validation."""
 
-    x = torch.as_tensor(X_train, dtype=torch.float32)
-    y = torch.as_tensor(y_train, dtype=torch.float32).reshape(-1, 1)
     train_loader = DataLoader(
-        TensorDataset(x[:split], y[:split]),
+        TensorDataset(
+            torch.as_tensor(X_train, dtype=torch.float32),
+            torch.as_tensor(y_train, dtype=torch.float32).reshape(-1, 1),
+        ),
         batch_size=int(args.batch_size),
         shuffle=True,
     )
+
     val_loader = DataLoader(
-        TensorDataset(x[split:], y[split:]),
+        TensorDataset(
+            torch.as_tensor(X_val, dtype=torch.float32),
+            torch.as_tensor(y_val, dtype=torch.float32).reshape(-1, 1),
+        ),
         batch_size=int(args.batch_size),
         shuffle=False,
     )
 
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(args.learning_rate))
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(args.learning_rate),
+    )
+
     best_val = float("inf")
-    best_state = copy.deepcopy(model.state_dict())
     best_epoch = 0
     bad_epochs = 0
     patience = 10
+
     started = time.perf_counter()
 
     for epoch in range(1, int(args.epoch) + 1):
         model.train()
+
         for batch_x, batch_y in train_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
+
             optimizer.zero_grad(set_to_none=True)
+
             mean, sigma = model(batch_x)
             loss = gaussian_nll(mean, sigma, batch_y)
+
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+        # Validation
         model.eval()
+
         val_sum = 0.0
         val_count = 0
+
         with torch.no_grad():
             for batch_x, batch_y in val_loader:
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
+
                 mean, sigma = model(batch_x)
                 val_loss = gaussian_nll(mean, sigma, batch_y)
+
                 val_sum += float(val_loss.item()) * len(batch_y)
                 val_count += len(batch_y)
+
         val_loss_value = val_sum / max(1, val_count)
 
         if val_loss_value < best_val:
             best_val = val_loss_value
-            best_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch
             bad_epochs = 0
         else:
             bad_epochs += 1
+
             if bad_epochs >= patience:
                 break
 
-    model.load_state_dict(best_state)
     elapsed = time.perf_counter() - started
-    return model, elapsed, best_epoch
 
+    if best_epoch == 0:
+        raise RuntimeError("DeepAR failed to select a valid training epoch.")
+
+    return best_epoch, elapsed
+
+
+def fit_deepar_full_train(
+    model: DeepARGaussian,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    args,
+    device: torch.device,
+    epochs: int,
+) -> Tuple[DeepARGaussian, float]:
+    """Train a fresh DeepAR model on all training windows."""
+
+    loader = DataLoader(
+        TensorDataset(
+            torch.as_tensor(X_train, dtype=torch.float32),
+            torch.as_tensor(y_train, dtype=torch.float32).reshape(-1, 1),
+        ),
+        batch_size=int(args.batch_size),
+        shuffle=True,
+    )
+
+    model = model.to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(args.learning_rate),
+    )
+
+    started = time.perf_counter()
+
+    for _epoch in range(epochs):
+        model.train()
+
+        for batch_x, batch_y in loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            mean, sigma = model(batch_x)
+            loss = gaussian_nll(mean, sigma, batch_y)
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+    elapsed = time.perf_counter() - started
+
+    return model, elapsed
 
 def predict_deepar(
     model: DeepARGaussian,
@@ -416,17 +617,187 @@ def fit_med_same_validation(
     train_data: Tuple[pd.DataFrame, pd.DataFrame],
     args,
     device: torch.device,
-) -> float:
-    """Train author's MED architecture with chronological validation.
-
-    The MED network, forward pass, dual-task loss and data builder are from the
-    author's code. This helper uses a chronological holdout instead of the
-    repository's 5-fold loop so that checkpoint selection is time-ordered.
+) -> Tuple[float, int]:
     """
+    Select the best epoch using chronological validation.
+
+    Scalers are fitted only on the training prefix.
+    The returned model is used only for epoch selection.
+    """
+
     df_a, df_t = train_data
+
+    # Create chronological train/validation windows
+    windows = make_chronological_validation_windows(
+        train_data,
+        args,
+        val_ratio=0.2,
+    )
+
+    # Use scalers fitted on the training prefix
+    med_wrapper.scaler_a = windows["scaler_a"]
+    med_wrapper.scaler_t = windows["scaler_t"]
+
     med_wrapper.key_idx = df_t.columns.get_loc(med_wrapper.key_var)
+
+    X_t_train = windows["X_t_train"]
+    X_a_train = windows["X_a_train"]
+    y_t_train = windows["y_t_train"]
+    y_a_train = windows["y_a_train"]
+
+    X_t_val = windows["X_t_val"]
+    X_a_val = windows["X_a_val"]
+    y_t_val = windows["y_t_val"]
+    y_a_val = windows["y_a_val"]
+
+    def make_loader(
+        X_t,
+        X_a,
+        y_t,
+        y_a,
+        shuffle: bool,
+    ) -> DataLoader:
+
+        dataset = CustomDatasetD(
+            X_t,
+            X_a,
+            X_t[:, -med_wrapper.t_dec_steps:],
+            X_a[:, -med_wrapper.a_dec_steps:],
+            y_t,
+            y_a,
+        )
+
+        return DataLoader(
+            dataset,
+            batch_size=med_wrapper.batch_size,
+            shuffle=shuffle,
+        )
+
+    train_loader = make_loader(
+        X_t_train,
+        X_a_train,
+        y_t_train,
+        y_a_train,
+        shuffle=True,
+    )
+
+    val_loader = make_loader(
+        X_t_val,
+        X_a_val,
+        y_t_val,
+        y_a_val,
+        shuffle=False,
+    )
+
+    model = med_wrapper.model.to(device)
+    optimizer = med_wrapper.optimizer
+    criterion = med_wrapper.criterion
+    alpha = med_wrapper.loss_alpha
+
+    best_val = float("inf")
+    best_epoch = 0
+    bad_epochs = 0
+    patience = 10
+
+    started = time.perf_counter()
+
+    for epoch in range(1, int(args.epoch) + 1):
+
+        # Training
+        model.train()
+
+        for batch in train_loader:
+            t_src = batch["X_enc_t"].to(device)
+            a_src = batch["X_enc_a"].to(device)
+
+            t_dec = batch["X_dec_t"].to(device)
+            a_dec = batch["X_dec_a"].to(device)
+
+            t_y = batch["y_train_t"].to(device)
+            a_y = batch["y_train_a"].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            t_out, a_out = model(t_src, a_src, t_dec, a_dec)
+
+            t_out = t_out[:, -1]
+            a_out = a_out[:, -1]
+
+            loss_t = criterion(t_out, t_y.view_as(t_out))
+            loss_a = criterion(a_out, a_y.view_as(a_out))
+
+            loss = loss_t + alpha * loss_a
+
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(
+                model.parameters(),
+                med_wrapper.grad_clip,
+            )
+
+            optimizer.step()
+
+        # Validation: select checkpoint based on target forecasting loss
+        model.eval()
+
+        val_sum = 0.0
+        val_count = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                t_src = batch["X_enc_t"].to(device)
+                a_src = batch["X_enc_a"].to(device)
+
+                t_dec = batch["X_dec_t"].to(device)
+                a_dec = batch["X_dec_a"].to(device)
+
+                t_y = batch["y_train_t"].to(device)
+
+                t_out, _ = model(t_src, a_src, t_dec, a_dec)
+                t_out = t_out[:, -1]
+
+                val_loss = criterion(t_out, t_y.view_as(t_out))
+
+                val_sum += float(val_loss.item()) * len(t_y)
+                val_count += len(t_y)
+
+        val_loss_value = val_sum / max(1, val_count)
+
+        if val_loss_value < best_val:
+            best_val = val_loss_value
+            best_epoch = epoch
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+            if bad_epochs >= patience:
+                break
+
+    elapsed = time.perf_counter() - started
+
+    if best_epoch == 0:
+        raise RuntimeError("MED failed to select a valid training epoch.")
+
+    return elapsed, best_epoch
+
+def fit_med_full_train(
+    med_wrapper: MEDModel,
+    train_data: Tuple[pd.DataFrame, pd.DataFrame],
+    args,
+    device: torch.device,
+    epochs: int,
+) -> float:
+    """Train a fresh MED model on all training windows."""
+
+    df_a, df_t = train_data
+
+    med_wrapper.key_idx = df_t.columns.get_loc(med_wrapper.key_var)
+
+    # Fit scalers on the COMPLETE training period
     scaled_a = med_wrapper.scaler_a.fit_transform(df_a)
     scaled_t = med_wrapper.scaler_t.fit_transform(df_t)
+
+    # Create all training windows
     X_t, X_a, y_t, y_a = create_dataset_two_freq(
         [scaled_a, scaled_t],
         freq_r=med_wrapper.freq_ratio,
@@ -435,91 +806,71 @@ def fit_med_same_validation(
         a_output_steps=med_wrapper.a_out_steps,
         target_idx=med_wrapper.key_idx,
     )
+
     X_t = np.asarray(X_t, dtype=np.float32)
     X_a = np.asarray(X_a, dtype=np.float32)
     y_t = np.asarray(y_t, dtype=np.float32)
     y_a = np.asarray(y_a, dtype=np.float32)
 
-    n = len(y_t)
-    if n < 10:
-        raise ValueError("MED requires at least 10 training windows.")
-    val_n = max(1, int(round(n * 0.2)))
-    split = n - val_n
-    train_idx = np.arange(split)
-    val_idx = np.arange(split, n)
+    dataset = CustomDatasetD(
+        X_t,
+        X_a,
+        X_t[:, -med_wrapper.t_dec_steps:],
+        X_a[:, -med_wrapper.a_dec_steps:],
+        y_t,
+        y_a,
+    )
 
-    def make_loader(indices: np.ndarray, shuffle: bool) -> DataLoader:
-        dataset = CustomDatasetD(
-            X_t[indices],
-            X_a[indices],
-            X_t[indices, -med_wrapper.t_dec_steps:],
-            X_a[indices, -med_wrapper.a_dec_steps:],
-            y_t[indices],
-            y_a[indices],
-        )
-        return DataLoader(dataset, batch_size=med_wrapper.batch_size, shuffle=shuffle)
+    loader = DataLoader(
+        dataset,
+        batch_size=med_wrapper.batch_size,
+        shuffle=True,
+    )
 
-    train_loader = make_loader(train_idx, shuffle=True)
-    val_loader = make_loader(val_idx, shuffle=False)
     model = med_wrapper.model.to(device)
     optimizer = med_wrapper.optimizer
     criterion = med_wrapper.criterion
     alpha = med_wrapper.loss_alpha
-    best_val = float("inf")
-    best_state = copy.deepcopy(model.state_dict())
-    patience = 10
-    bad_epochs = 0
+
     started = time.perf_counter()
 
-    for _epoch in range(1, int(args.epoch) + 1):
+    # Train for the epoch count selected by validation
+    for _epoch in range(epochs):
+
         model.train()
-        for batch in train_loader:
+
+        for batch in loader:
             t_src = batch["X_enc_t"].to(device)
             a_src = batch["X_enc_a"].to(device)
+
             t_dec = batch["X_dec_t"].to(device)
             a_dec = batch["X_dec_a"].to(device)
+
             t_y = batch["y_train_t"].to(device)
             a_y = batch["y_train_a"].to(device)
+
             optimizer.zero_grad(set_to_none=True)
+
             t_out, a_out = model(t_src, a_src, t_dec, a_dec)
+
             t_out = t_out[:, -1]
             a_out = a_out[:, -1]
+
             loss_t = criterion(t_out, t_y.view_as(t_out))
             loss_a = criterion(a_out, a_y.view_as(a_out))
+
             loss = loss_t + alpha * loss_a
+
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), med_wrapper.grad_clip)
+
+            nn.utils.clip_grad_norm_(
+                model.parameters(),
+                med_wrapper.grad_clip,
+            )
+
             optimizer.step()
 
-        model.eval()
-        val_sum = 0.0
-        val_count = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                t_src = batch["X_enc_t"].to(device)
-                a_src = batch["X_enc_a"].to(device)
-                t_dec = batch["X_dec_t"].to(device)
-                a_dec = batch["X_dec_a"].to(device)
-                t_y = batch["y_train_t"].to(device)
-                t_out, _ = model(t_src, a_src, t_dec, a_dec)
-                t_out = t_out[:, -1]
-                val_loss = criterion(t_out, t_y.view_as(t_out))
-                val_sum += float(val_loss.item()) * len(t_y)
-                val_count += len(t_y)
-        val_loss_value = val_sum / max(1, val_count)
-
-        if val_loss_value < best_val:
-            best_val = val_loss_value
-            best_state = copy.deepcopy(model.state_dict())
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                break
-
-    model.load_state_dict(best_state)
     return time.perf_counter() - started
-
 
 def count_parameters(model: nn.Module) -> int:
     return int(sum(param.numel() for param in model.parameters() if param.requires_grad))
@@ -535,6 +886,11 @@ def run_experiment(args, output_dir: Path, skip_med: bool = False) -> None:
     print("Device: {}".format(device))
 
     train_data, test_data = DataProcessor(args).preprocess()
+    check_mixed_frequency_alignment(
+    train_data,
+    test_data,
+    args
+    )
     train_a, train_t = train_data
     test_a, test_t = test_data
     check_input_data(train_data, test_data)
@@ -569,6 +925,10 @@ def run_experiment(args, output_dir: Path, skip_med: bool = False) -> None:
             "Test windows ({}) do not align with test observations ({}). "
             "Check the frequency ratio and encoder windows.".format(len(X_t_test), len(actual))
         )
+
+    # Extract target history for DeepAR
+    deepar_train_x = X_t_train[:, :, target_idx:target_idx + 1]
+    deepar_test_x = X_t_test[:, :, target_idx:target_idx + 1]
 
     records = []
     predictions: Dict[str, np.ndarray] = {}
@@ -616,48 +976,148 @@ def run_experiment(args, output_dir: Path, skip_med: bool = False) -> None:
         "Details": "Unrestricted OLS; {} lag features".format(umidas_features),
     })
 
-    # 4) DeepAR: univariate target history -> Gaussian forecast distribution.
+    # 4) DeepAR: chronological validation + full training refit
     print("\n[4/5] DeepAR (Gaussian LSTM)")
+
+    # Create validation windows using scalers fitted only on the prefix
+    validation_data = make_chronological_validation_windows(
+        train_data,
+        args,
+        val_ratio=0.2,
+    )
+
+    deepar_val_train_x = validation_data["X_t_train"][
+        :, :, target_idx:target_idx + 1
+    ]
+    deepar_val_train_y = validation_data["y_t_train"]
+
+    deepar_val_x = validation_data["X_t_val"][
+        :, :, target_idx:target_idx + 1
+    ]
+    deepar_val_y = validation_data["y_t_val"]
+
+    # Stage 1: Select the best epoch
     set_seed(int(args.seed))
-    deepar_train_x = X_t_train[:, :, target_idx:target_idx + 1]
-    deepar_test_x = X_t_test[:, :, target_idx:target_idx + 1]
+
+    deepar_validation_model = DeepARGaussian(
+        hidden_size=int(args.t_enc_hd),
+        dropout=float(args.t_enc_dropout),
+    )
+
+    best_epoch, validation_time = select_deepar_epoch(
+        deepar_validation_model,
+        deepar_val_train_x,
+        deepar_val_train_y,
+        deepar_val_x,
+        deepar_val_y,
+        args,
+        device,
+    )
+
+    # Stage 2: Initialize a fresh model and train on ALL training windows
+    set_seed(int(args.seed))
+
     deepar = DeepARGaussian(
         hidden_size=int(args.t_enc_hd),
         dropout=float(args.t_enc_dropout),
     )
-    deepar, deepar_time, best_epoch = fit_deepar(
-        deepar, deepar_train_x, y_train, args, device
+
+    deepar, final_train_time = fit_deepar_full_train(
+        deepar,
+        deepar_train_x,
+        y_train,
+        args,
+        device,
+        epochs=best_epoch,
     )
-    deepar_mean_scaled = predict_deepar(deepar, deepar_test_x, args, device)
-    deepar_pred = inverse_target_scale(deepar_mean_scaled, scaler_t, target_idx)
+
+    deepar_time = validation_time + final_train_time
+
+    # Test prediction
+    deepar_mean_scaled = predict_deepar(
+        deepar,
+        deepar_test_x,
+        args,
+        device,
+    )
+
+    deepar_pred = inverse_target_scale(
+        deepar_mean_scaled,
+        scaler_t,
+        target_idx,
+    )
+
     predictions["deepar"] = deepar_pred
+
     records.append({
         "Model": "DeepAR (Gaussian LSTM)",
         **regression_metrics(actual, deepar_pred),
         "Parameters": count_parameters(deepar),
         "TrainTimeSec": deepar_time,
-        "Details": "One-step Gaussian autoregressive LSTM; best epoch {}".format(best_epoch),
+        "Details": (
+            "One-step Gaussian LSTM; chronological validation; "
+            "refit on full train; best epoch {}".format(best_epoch)
+        ),
     })
 
-    # 5) MED from the authors' repository.
+    # 5) MED: chronological validation + full training refit
     if not skip_med:
         print("\n[5/5] MED (author implementation)")
+
+        # Stage 1: Select the best epoch
         set_seed(int(args.seed))
+
+        med_validation_wrapper = MEDModel(args)
+        med_validation_wrapper.device = device
+
+        med_validation_time, med_best_epoch = fit_med_same_validation(
+            med_validation_wrapper,
+            train_data,
+            args,
+            device,
+        )
+
+        # Stage 2: Create a completely fresh MED model
+        set_seed(int(args.seed))
+
         med_wrapper = MEDModel(args)
         med_wrapper.device = device
-        med_wrapper.model = med_wrapper.model.to(device)
+
         med_params = count_parameters(med_wrapper.model)
-        med_time = fit_med_same_validation(med_wrapper, train_data, args, device)
-        med_pred = np.asarray(med_wrapper.test(test_data, train_data), dtype=float).reshape(-1)
+
+        med_final_time = fit_med_full_train(
+            med_wrapper,
+            train_data,
+            args,
+            device,
+            epochs=med_best_epoch,
+        )
+
+        med_time = med_validation_time + med_final_time
+
+        # Predict on test data
+        med_pred = np.asarray(
+            med_wrapper.test(test_data, train_data),
+            dtype=float,
+        ).reshape(-1)
+
         if len(med_pred) != len(actual):
-            raise ValueError("MED predictions do not align with the test observations.")
+            raise ValueError(
+                "MED predictions do not align with the test observations."
+            )
+
         predictions["med"] = med_pred
+
         records.append({
             "Model": "MED (author implementation)",
             **regression_metrics(actual, med_pred),
             "Parameters": med_params,
             "TrainTimeSec": med_time,
-            "Details": "Author's dual-frequency MED with MFA",
+            "Details": (
+                "Author's dual-frequency MED with MFA; "
+                "chronological validation; refit on full train; "
+                "best epoch {}".format(med_best_epoch)
+            ),
         })
 
     metrics_df = pd.DataFrame(records).sort_values("RMSE", ascending=True)

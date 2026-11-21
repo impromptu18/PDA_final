@@ -79,7 +79,6 @@ weather["dt_iso"] = pd.to_datetime(
     utc=True
 ).dt.tz_localize(None)
 
-# Chuyển về timezone của Tây Ban Nha.
 # Spain sử dụng CET/CEST và pandas sẽ tự xử lý DST.
 
 
