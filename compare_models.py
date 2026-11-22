@@ -910,7 +910,7 @@ def run_experiment(args, output_dir: Path, skip_med: bool = False) -> None:
         aux_train_scaled, target_train_scaled, args, target_idx
     )
     check_window_lengths(X_t_train, X_a_train, args)
-
+    
     # Preserve the last source encoder context when creating test windows.
     aux_context = pd.concat([train_a.tail(int(args.a_enc_time_steps)), test_a])
     target_context = pd.concat([train_t.tail(int(args.t_enc_time_steps)), test_t])
@@ -920,6 +920,16 @@ def run_experiment(args, output_dir: Path, skip_med: bool = False) -> None:
         X_a_context, X_t_context, args, target_idx
     )
     check_window_lengths(X_t_test, X_a_test, args)
+    # Save the exact scaled windows used in the experiment
+    np.savez_compressed(
+        output_dir / "med_shap_data.npz",
+        X_t_train=X_t_train,
+        X_a_train=X_a_train,
+        X_t_test=X_t_test,
+        X_a_test=X_a_test,
+    )
+
+    print("Saved MED SHAP input windows.")    
     if len(X_t_test) != len(actual):
         raise ValueError(
             "Test windows ({}) do not align with test observations ({}). "
@@ -1092,6 +1102,16 @@ def run_experiment(args, output_dir: Path, skip_med: bool = False) -> None:
             device,
             epochs=med_best_epoch,
         )
+
+        # Save the final trained MED model
+        model_path = output_dir / "med_model_state_dict.pth"
+
+        torch.save(
+            med_wrapper.model.state_dict(),
+            model_path,
+        )
+
+        print(f"Saved MED model: {model_path}")
 
         med_time = med_validation_time + med_final_time
 
