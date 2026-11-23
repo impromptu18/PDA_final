@@ -1,0 +1,12 @@
+﻿Frequency,Feature,MeanAbsSHAP
+Target,load_actual,0.06830012356868505
+Auxiliary,humidity_Seville,0.002833536645333576
+Auxiliary,temp_Seville,0.0027665056147080113
+Auxiliary,humidity_Valencia,0.002194273822419686
+Auxiliary,temp_Barcelona,0.001862075923236357
+Auxiliary,temp_Valencia,0.0017381053490443733
+Auxiliary,temp_Madrid,0.0017022206133701543
+Auxiliary,temp_Bilbao,0.0016350948891939352
+Auxiliary,humidity_Bilbao,0.0014030086283476862
+Auxiliary,humidity_Madrid,0.001308448837431413
+Auxiliary,humidity_Barcelona,0.000841661410383492
